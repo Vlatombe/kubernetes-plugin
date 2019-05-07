@@ -18,29 +18,33 @@ package org.csanchez.jenkins.plugins.kubernetes.pipeline;
 
 import static org.csanchez.jenkins.plugins.kubernetes.pipeline.Constants.*;
 
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
+import java.io.PipedInputStream;
+import java.io.PipedOutputStream;
 import java.io.PrintStream;
 import java.io.Serializable;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+import org.apache.commons.io.output.NullOutputStream;
 import org.apache.commons.io.output.TeeOutputStream;
 import org.csanchez.jenkins.plugins.kubernetes.pipeline.proc.CachedProc;
 import org.csanchez.jenkins.plugins.kubernetes.pipeline.proc.DeadProc;
+import org.jenkinsci.plugins.workflow.steps.EnvironmentExpander;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
@@ -60,8 +64,6 @@ import io.fabric8.kubernetes.client.dsl.ExecListener;
 import io.fabric8.kubernetes.client.dsl.ExecWatch;
 import io.fabric8.kubernetes.client.dsl.Execable;
 import okhttp3.Response;
-import org.apache.commons.io.output.NullOutputStream;
-import org.jenkinsci.plugins.workflow.steps.EnvironmentExpander;
 
 /**
  * This decorator interacts directly with the Kubernetes exec API to run commands inside a container. It does not use
@@ -73,11 +75,24 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
     private static final long serialVersionUID = 4419929753433397655L;
     private static final long DEFAULT_CONTAINER_READY_TIMEOUT = 5;
     private static final String CONTAINER_READY_TIMEOUT_SYSTEM_PROPERTY = ContainerExecDecorator.class.getName() + ".containerReadyTimeout";
+
+    private static final String WEBSOCKET_CONNECTION_TIMEOUT_SYSTEM_PROPERTY = ContainerExecDecorator.class.getName()
+            + ".websocketConnectionTimeout";
+    /** time to wait in seconds for websocket to connect */
+    private static final int WEBSOCKET_CONNECTION_TIMEOUT = Integer
+            .getInteger(WEBSOCKET_CONNECTION_TIMEOUT_SYSTEM_PROPERTY, 30);
     private static final long CONTAINER_READY_TIMEOUT = containerReadyTimeout();
     private static final String COOKIE_VAR = "JENKINS_SERVER_COOKIE";
 
     private static final Logger LOGGER = Logger.getLogger(ContainerExecDecorator.class.getName());
     private static final String DEFAULT_SHELL="/bin/sh";
+
+    /**
+     * stdin buffer size for commands sent to Kubernetes exec api. A low value will cause slowness in commands executed.
+     * A higher value will consume more memory
+     */
+    private static final int STDIN_BUFFER_SIZE = Integer
+            .getInteger(ContainerExecDecorator.class.getName() + ".stdinBufferSize", 2 * 1024);
 
     private transient KubernetesClient client;
 
@@ -234,10 +249,12 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
                         }
                     }
                 }
-                return doLaunch(starter.quiet(), envVars, starter.stdout(), starter.pwd(), getCommands(starter));
+                return doLaunch(starter.quiet(), envVars, starter.stdout(), starter.pwd(), starter.masks(),
+                        getCommands(starter));
             }
 
-            private Proc doLaunch(boolean quiet, String [] cmdEnvs,  OutputStream outputForCaller, FilePath pwd, String... commands) throws IOException {
+            private Proc doLaunch(boolean quiet, String[] cmdEnvs, OutputStream outputForCaller, FilePath pwd,
+                    boolean[] masks, String... commands) throws IOException {
                 if (processes == null) {
                     processes = new HashMap<>();
                 }
@@ -251,7 +268,7 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
                     return new CachedProc(processes.get(p));
                 }
 
-                waitUntilContainerIsReady();
+                waitUntilPodContainersAreReady();
 
                 final CountDownLatch started = new CountDownLatch(1);
                 final CountDownLatch finished = new CountDownLatch(1);
@@ -266,22 +283,23 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
                     printStream = new PrintStream(stream, false, StandardCharsets.UTF_8.toString());
                 }
 
-                // we need to keep the last bytes in the stream to parse the exit code as it is printed there
-                // so we use a buffer
-                ExitCodeOutputStream exitCodeOutputStream = new ExitCodeOutputStream();
-                // send container output to all 3 streams (pid, out, job).
-                stream = new TeeOutputStream(exitCodeOutputStream, stream);
                 // Send to proc caller as well if they sent one
-                if (outputForCaller != null) {
+                if (outputForCaller != null && !outputForCaller.equals(stream)) {
                     stream = new TeeOutputStream(outputForCaller, stream);
                 }
+                ByteArrayOutputStream error = new ByteArrayOutputStream();
 
                 String msg = "Executing shell script inside container [" + containerName + "] of pod [" + podName + "]";
                 LOGGER.log(Level.FINEST, msg);
                 printStream.println(msg);
 
-                Execable<String, ExecWatch> execable = client.pods().inNamespace(namespace).withName(podName).inContainer(containerName)
-                        .redirectingInput().writingOutput(stream).writingError(stream)
+                if (closables == null) {
+                    closables = new ArrayList<>();
+                }
+
+                Execable<String, ExecWatch> execable = client.pods().inNamespace(namespace).withName(podName).inContainer(containerName) //
+                        .redirectingInput(STDIN_BUFFER_SIZE) // JENKINS-50429
+                        .writingOutput(stream).writingError(stream).writingErrorChannel(error)
                         .usingListener(new ExecListener() {
                             @Override
                             public void onOpen(Response response) {
@@ -321,58 +339,75 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
                     watch = execable.exec(getShell());
                 } catch (KubernetesClientException e) {
                     if (e.getCause() instanceof InterruptedException) {
-                        throw new IOException("JENKINS-40825: interrupted while starting websocket connection", e);
+                        throw new IOException(
+                                "Interrupted while starting websocket connection, you should increase the Max connections to Kubernetes API",
+                                e);
                     } else {
                         throw e;
                     }
+                } catch (RejectedExecutionException e) {
+                    throw new IOException(
+                            "Connection was rejected, you should increase the Max connections to Kubernetes API", e);
                 }
 
+                boolean hasStarted = false;
                 try {
-                    started.await();
+                    // prevent a wait forever if the connection is closed as the listener would never be called
+                    hasStarted = started.await(WEBSOCKET_CONNECTION_TIMEOUT, TimeUnit.SECONDS);
                 } catch (InterruptedException e) {
                     closeWatch(watch);
-                    throw new IOException("JENKINS-40825: interrupted while waiting for websocket connection", e);
+                    throw new IOException(
+                            "Interrupted while waiting for websocket connection, you should increase the Max connections to Kubernetes API",
+                            e);
+                }
+
+                if (!hasStarted) {
+                    closeWatch(watch);
+                    throw new IOException("Timed out waiting for websocket connection. "
+                            + "You should increase the value of system property "
+                            + WEBSOCKET_CONNECTION_TIMEOUT_SYSTEM_PROPERTY + " currently set at "
+                            + WEBSOCKET_CONNECTION_TIMEOUT + " seconds");
                 }
 
                 try {
+                    OutputStream stdin = watch.getInput();
                     if (pwd != null) {
                         // We need to get into the project workspace.
                         // The workspace is not known in advance, so we have to execute a cd command.
-                        watch.getInput().write(
-                                String.format("cd \"%s\"%s", pwd, NEWLINE).getBytes(StandardCharsets.UTF_8));
-
-                    }
-                    //get global vars here, run the export first as they'll get overwritten.
-                    if (globalVars != null) {
-                            this.setupEnvironmentVariable(globalVars, watch);
-                    }
-
-                    if(rcEnvVars != null) {
-                        this.setupEnvironmentVariable(rcEnvVars, watch);
+                        stdin.write(String.format("cd \"%s\"%s", pwd, NEWLINE).getBytes(StandardCharsets.UTF_8));
                     }
 
                     EnvVars envVars = new EnvVars();
+
+                    //get global vars here, run the export first as they'll get overwritten.
+                    if (globalVars != null) {
+                        envVars.overrideAll(globalVars);
+                    }
+
+                    if(rcEnvVars != null) {
+                        envVars.overrideAll(rcEnvVars);
+                    }
+
                     if (environmentExpander != null) {
                         environmentExpander.expand(envVars);
                     }
 
                     //setup specific command envs passed into cmd
                     if (cmdEnvs != null) {
-                        LOGGER.log(Level.FINEST, "Launching with env vars: {0}", Arrays.toString(cmdEnvs));
                         for (String cmdEnv : cmdEnvs) {
                             envVars.addLine(cmdEnv);
                         }
                     }
 
-                    this.setupEnvironmentVariable(envVars, watch);
-                    doExec(watch, printStream, commands);
-                    if (closables == null) {
-                        closables = new ArrayList<>();
-                    }
+                    LOGGER.log(Level.FINEST, "Launching with env vars: {0}", envVars.toString());
+
+                    this.setupEnvironmentVariable(envVars, stdin);
+
+                    doExec(stdin, printStream, masks, commands);
 
                     int pid = readPidFromPidFile(commands);
                     LOGGER.log(Level.INFO, "Created process inside pod: ["+podName+"], container: ["+containerName+"] with pid:["+pid+"]");
-                    ContainerExecProc proc = new ContainerExecProc(watch, alive, finished, exitCodeOutputStream::getExitCode);
+                    ContainerExecProc proc = new ContainerExecProc(watch, alive, finished, stdin, error);
                     processes.put(pid, proc);
                     closables.add(proc);
                     return proc;
@@ -391,18 +426,18 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
                 String cookie = modelEnvVars.get(COOKIE_VAR);
 
                 int exitCode = doLaunch(
-                        true, null, null, null,
+                        true, null, null, null, null,
                         "sh", "-c", "kill \\`grep -l '" + COOKIE_VAR + "=" + cookie  +"' /proc/*/environ | cut -d / -f 3 \\`"
                 ).join();
 
                 getListener().getLogger().println("kill finished with exit code " + exitCode);
             }
 
-            private void setupEnvironmentVariable(EnvVars vars, ExecWatch watch) throws IOException {
+            private void setupEnvironmentVariable(EnvVars vars, OutputStream out) throws IOException {
                 for (Map.Entry<String, String> entry : vars.entrySet()) {
                     //Check that key is bash compliant.
                     if (entry.getKey().matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
-                            watch.getInput().write(
+                            out.write(
                                     String.format(
                                             "export %s='%s'%s",
                                             entry.getKey(),
@@ -414,10 +449,13 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
                     }
             }
 
-            private void waitUntilContainerIsReady() throws IOException {
+            private void waitUntilPodContainersAreReady() throws IOException {
+                LOGGER.log(Level.FINEST, "Waiting until pod containers are ready: {0}/{1}",
+                        new String[] { namespace, podName });
                 try {
                     Pod pod = client.pods().inNamespace(namespace).withName(podName)
                             .waitUntilReady(CONTAINER_READY_TIMEOUT, TimeUnit.MINUTES);
+                    LOGGER.log(Level.FINEST, "Pod is ready: {0}/{1}", new String[] { namespace, podName });
 
                     if (pod == null || pod.getStatus() == null || pod.getStatus().getContainerStatuses() == null) {
                         throw new IOException("Failed to execute shell script inside container " +
@@ -458,29 +496,34 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
         }
     }
 
-    private static void doExec(ExecWatch watch, PrintStream out, String... statements) {
+    private static void doExec(OutputStream stdin, PrintStream out, boolean[] masks, String... statements) {
         try {
             out.print("Executing command: ");
             StringBuilder sb = new StringBuilder();
-            for (String stmt : statements) {
-                String s = String.format("\"%s\" ", stmt);
-                sb.append(s);
-                out.print(s);
-                watch.getInput().write(s.getBytes(StandardCharsets.UTF_8));
+            for (int i = 0; i < statements.length; i++) {
+                String s = String.format("\"%s\" ", statements[i]);
+                if (masks != null && masks[i]) {
+                    sb.append("******** ");
+                    out.print("******** ");
+                } else {
+                    sb.append(s);
+                    out.print(s);
+                }
+                stdin.write(s.getBytes(StandardCharsets.UTF_8));
             }
             sb.append(NEWLINE);
             out.println();
-            watch.getInput().write(NEWLINE.getBytes(StandardCharsets.UTF_8));
+            stdin.write(NEWLINE.getBytes(StandardCharsets.UTF_8));
 
             // get the command exit code and print it padded so it is easier to parse in ContainerExecProc
             // We need to exit so that we know when the command has finished.
-            sb.append(ExitCodeOutputStream.EXIT_COMMAND);
-            out.print(ExitCodeOutputStream.EXIT_COMMAND);
+            sb.append(EXIT + NEWLINE);
+            out.print(EXIT + NEWLINE);
             LOGGER.log(Level.FINEST, "Executing command: {0}", sb);
-             watch.getInput().write(ExitCodeOutputStream.EXIT_COMMAND.getBytes(StandardCharsets.UTF_8));
+            stdin.write((EXIT + NEWLINE).getBytes(StandardCharsets.UTF_8));
 
             out.flush();
-            watch.getInput().flush();
+            stdin.flush();
         } catch (IOException e) {
             e.printStackTrace(out);
             throw new RuntimeException(e);
@@ -561,50 +604,5 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
 
     public void setKubernetesClient(KubernetesClient client) {
         this.client = client;
-    }
-
-    /**
-     * Keeps the last bytes of the output stream to parse the exit code
-     */
-    static class ExitCodeOutputStream extends OutputStream {
-
-        public static final String EXIT_COMMAND_TXT = "EXITCODE";
-        public static final String EXIT_COMMAND = "printf \"" + EXIT_COMMAND_TXT + " %3d\" $?; " + EXIT + NEWLINE;
-
-        private EvictingQueue<Integer> queue = EvictingQueue.create(20);
-
-        public ExitCodeOutputStream() {
-        }
-
-        @Override
-        public void write(int b) throws IOException {
-            queue.add(b);
-            byte[] bb = new byte[]{(byte) b};
-            System.out.print(new String(bb, StandardCharsets.UTF_8));
-        }
-
-        public int getExitCode() {
-            ByteBuffer b = ByteBuffer.allocate(queue.size());
-            queue.stream().filter(Objects::nonNull).forEach((i) -> b.put((byte) i.intValue()));
-            // output ends in a 3 digit padded exit code + newline (13 10)
-            // as defined in ContainerExecDecorator#doExec
-            // ie. 32 32 49 13 10 for exit code 1
-            int i = 1;
-            String s = new String(b.array(), StandardCharsets.UTF_8);
-            if (s.indexOf(EXIT_COMMAND_TXT) < 0) {
-                LOGGER.log(Level.WARNING, "Unable to find \"{0}\" in {1}", new Object[]{EXIT_COMMAND_TXT, s});
-                return i;
-            }
-            // parse the exitcode int printed after EXITCODE
-            int start = s.indexOf(EXIT_COMMAND_TXT) + EXIT_COMMAND_TXT.length();
-            s = s.substring(start, start + 4).trim();
-            try {
-                i = Integer.parseInt(s);
-            } catch (NumberFormatException e) {
-                LOGGER.log(Level.WARNING, "Unable to parse exit code as integer: \"{0}\" {1} / {2}",
-                        new Object[]{s, queue.toString(), Arrays.toString(b.array())});
-            }
-            return i;
-        }
     }
 }

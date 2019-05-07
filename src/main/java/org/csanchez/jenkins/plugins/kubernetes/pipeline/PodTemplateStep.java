@@ -6,10 +6,13 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 
+import com.google.common.collect.ImmutableSet;
+
 import org.csanchez.jenkins.plugins.kubernetes.ContainerTemplate;
 import org.csanchez.jenkins.plugins.kubernetes.PodAnnotation;
 import org.csanchez.jenkins.plugins.kubernetes.PodTemplate;
 import org.csanchez.jenkins.plugins.kubernetes.model.TemplateEnvVar;
+import org.csanchez.jenkins.plugins.kubernetes.pod.retention.PodRetention;
 import org.csanchez.jenkins.plugins.kubernetes.volumes.PodVolume;
 import org.csanchez.jenkins.plugins.kubernetes.volumes.workspace.WorkspaceVolume;
 import org.jenkinsci.plugins.workflow.steps.Step;
@@ -18,8 +21,6 @@ import org.jenkinsci.plugins.workflow.steps.StepDescriptor;
 import org.jenkinsci.plugins.workflow.steps.StepExecution;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
-
-import com.google.common.collect.ImmutableSet;
 
 import hudson.Extension;
 import hudson.model.Node;
@@ -53,15 +54,16 @@ public class PodTemplateStep extends Step implements Serializable {
 
     private String serviceAccount;
     private String nodeSelector;
-    private Node.Mode nodeUsageMode;
+    private Node.Mode nodeUsageMode = Node.Mode.EXCLUSIVE;
     private String workingDir = ContainerTemplate.DEFAULT_WORKING_DIR;
 
     private String yaml;
+    private PodRetention podRetention;
 
     @DataBoundConstructor
     public PodTemplateStep(String label, String name) {
         this.label = label;
-        this.name = name == null ? "jenkins-slave" : name;
+        this.name = name == null ? label : name;
     }
 
     public String getLabel() {
@@ -194,7 +196,6 @@ public class PodTemplateStep extends Step implements Serializable {
         return nodeUsageMode;
     }
 
-    @DataBoundSetter
     public void setNodeUsageMode(Node.Mode nodeUsageMode) {
         this.nodeUsageMode = nodeUsageMode;
     }
@@ -203,7 +204,7 @@ public class PodTemplateStep extends Step implements Serializable {
     public void setNodeUsageMode(String nodeUsageMode) {
         this.nodeUsageMode = Node.Mode.valueOf(nodeUsageMode);
     }
-    
+
     public String getWorkingDir() {
         return workingDir;
     }
@@ -249,6 +250,15 @@ public class PodTemplateStep extends Step implements Serializable {
         this.yaml = yaml;
     }
 
+    public PodRetention getPodRetention() {
+        return this.podRetention;
+    }
+
+    @DataBoundSetter
+    public void setPodRetention(PodRetention podRetention) {
+        this.podRetention = podRetention;
+    }
+
     @Extension
     public static class DescriptorImpl extends StepDescriptor {
 
@@ -276,5 +286,6 @@ public class PodTemplateStep extends Step implements Serializable {
         public Set<? extends Class<?>> getRequiredContext() {
             return ImmutableSet.of(Run.class, TaskListener.class);
         }
+
     }
 }

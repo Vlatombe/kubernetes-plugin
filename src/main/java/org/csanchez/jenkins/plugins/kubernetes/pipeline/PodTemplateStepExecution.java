@@ -2,13 +2,17 @@ package org.csanchez.jenkins.plugins.kubernetes.pipeline;
 
 import static java.util.stream.Collectors.*;
 
+import java.util.HashSet;
+import java.util.Set;
+import java.util.Collection;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
-import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import org.apache.commons.lang.RandomStringUtils;
 import org.csanchez.jenkins.plugins.kubernetes.KubernetesCloud;
+import org.csanchez.jenkins.plugins.kubernetes.KubernetesFolderProperty;
+import org.csanchez.jenkins.plugins.kubernetes.Messages;
 import org.csanchez.jenkins.plugins.kubernetes.PodImagePullSecret;
 import org.csanchez.jenkins.plugins.kubernetes.PodTemplate;
 import org.jenkinsci.plugins.workflow.steps.AbstractStepExecutionImpl;
@@ -16,12 +20,17 @@ import org.jenkinsci.plugins.workflow.steps.BodyExecutionCallback;
 import org.jenkinsci.plugins.workflow.steps.StepContext;
 
 import com.google.common.base.Strings;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 
 import hudson.AbortException;
+import hudson.model.ItemGroup;
+import hudson.model.Job;
 import hudson.model.Run;
 import hudson.slaves.Cloud;
-import io.fabric8.kubernetes.client.KubernetesClient;
 import jenkins.model.Jenkins;
+import org.csanchez.jenkins.plugins.kubernetes.ContainerTemplate;
+import org.csanchez.jenkins.plugins.kubernetes.PodAnnotation;
+import org.csanchez.jenkins.plugins.kubernetes.PodTemplateUtils;
 
 public class PodTemplateStepExecution extends AbstractStepExecutionImpl {
 
@@ -57,15 +66,18 @@ public class PodTemplateStepExecution extends AbstractStepExecutionImpl {
         KubernetesCloud kubernetesCloud = (KubernetesCloud) cloud;
 
         Run<?, ?> run = getContext().get(Run.class);
-        PodTemplateAction podTemplateAction = run.getAction(PodTemplateAction.class);
-        NamespaceAction namespaceAction = run.getAction(NamespaceAction.class);
-        String parentTemplates = podTemplateAction != null ? podTemplateAction.getParentTemplates() : null;
+        if (kubernetesCloud.isUsageRestricted()) {
+            checkAccess(run, kubernetesCloud);
+        }
+
+        PodTemplateContext podTemplateContext = getContext().get(PodTemplateContext.class);
+        String parentTemplates = podTemplateContext != null ? podTemplateContext.getName() : null;
 
         //Let's generate a random name based on the user specified to make sure that we don't have
         //issues with concurrent builds, or messing with pre-existing configuration
         String randString = RandomStringUtils.random(5, "bcdfghjklmnpqrstvwxz0123456789");
         String name = String.format(NAME_FORMAT, step.getName(), randString);
-        String namespace = checkNamespace(kubernetesCloud, namespaceAction);
+        String namespace = checkNamespace(kubernetesCloud, podTemplateContext);
 
         newTemplate = new PodTemplate();
         newTemplate.setName(name);
@@ -84,33 +96,64 @@ public class PodTemplateStepExecution extends AbstractStepExecutionImpl {
         newTemplate.setNodeUsageMode(step.getNodeUsageMode());
         newTemplate.setServiceAccount(step.getServiceAccount());
         newTemplate.setAnnotations(step.getAnnotations());
+        if(run!=null) {
+            newTemplate.getAnnotations().add(new PodAnnotation("buildUrl", ((KubernetesCloud)cloud).getJenkinsUrlOrDie()+run.getUrl()));
+        }
         newTemplate.setImagePullSecrets(
                 step.getImagePullSecrets().stream().map(x -> new PodImagePullSecret(x)).collect(toList()));
         newTemplate.setYaml(step.getYaml());
+        newTemplate.setPodRetention(step.getPodRetention());
 
         if(step.getActiveDeadlineSeconds() != 0) {
             newTemplate.setActiveDeadlineSeconds(step.getActiveDeadlineSeconds());
         }
 
-        kubernetesCloud.addDynamicTemplate(newTemplate);
-        getContext().newBodyInvoker().withContext(step).withCallback(new PodTemplateCallback(newTemplate)).start();
+        for (ContainerTemplate container : newTemplate.getContainers()) {
+            if (!PodTemplateUtils.validateContainerName(container.getName())) {
+                throw new AbortException(Messages.RFC1123_error(container.getName()));
+            }
+        }
+        Collection<String> errors = PodTemplateUtils.validateYamlContainerNames(newTemplate.getYamls());
+        if (!errors.isEmpty()) {
+            throw new AbortException(Messages.RFC1123_error(String.join(", ", errors)));
+        }
 
-        PodTemplateAction.push(run, name);
-        NamespaceAction.push(run, namespace);
+        if (!PodTemplateUtils.validateLabel(newTemplate.getLabel())) {
+            throw new AbortException(Messages.label_error(newTemplate.getLabel()));
+        }
+
+        kubernetesCloud.addDynamicTemplate(newTemplate);
+        getContext().newBodyInvoker().withContexts(step, new PodTemplateContext(namespace, name)).withCallback(new PodTemplateCallback(newTemplate)).start();
+
         return false;
     }
 
-    @Override
-    public void stop(Throwable cause) throws Exception {
-        new PodTemplateAction(getContext().get(Run.class)).pop();
+    /**
+     * Check if the current Job is permitted to use the cloud.
+     *
+     * @param run
+     * @param kubernetesCloud
+     * @throws AbortException
+     *             in case the Job has not been authorized to use the
+     *             kubernetesCloud
+     */
+    private void checkAccess(Run<?, ?> run, KubernetesCloud kubernetesCloud) throws AbortException {
+        Job<?, ?> job = run.getParent(); // Return the associated Job for this Build
+        ItemGroup<?> parent = job.getParent(); // Get the Parent of the Job (which might be a Folder)
+
+        Set<String> allowedClouds = new HashSet<>();
+        KubernetesFolderProperty.collectAllowedClouds(allowedClouds, parent);
+        if (!allowedClouds.contains(kubernetesCloud.name)) {
+            throw new AbortException(String.format("Not authorized to use Kubernetes cloud: %s", step.getCloud()));
+        }
     }
 
-    private String checkNamespace(KubernetesCloud kubernetesCloud, @CheckForNull NamespaceAction namespaceAction) {
+    private String checkNamespace(KubernetesCloud kubernetesCloud, @CheckForNull PodTemplateContext podTemplateContext) {
         String namespace = null;
         if (!Strings.isNullOrEmpty(step.getNamespace())) {
             namespace = step.getNamespace();
-        } else if ((namespaceAction != null) && (!Strings.isNullOrEmpty(namespaceAction.getNamespace()))) {
-            namespace = namespaceAction.getNamespace();
+        } else if (podTemplateContext != null && !Strings.isNullOrEmpty(podTemplateContext.getNamespace())) {
+            namespace = podTemplateContext.getNamespace();
         } else {
             namespace = kubernetesCloud.getNamespace();
         }
@@ -157,17 +200,10 @@ public class PodTemplateStepExecution extends AbstractStepExecutionImpl {
                 return;
             }
             if (cloud instanceof KubernetesCloud) {
-                LOGGER.log(Level.INFO, "Removing pod template and deleting pod {1} from cloud {0}",
+                LOGGER.log(Level.INFO, "Removing pod template {1} from cloud {0}",
                         new Object[] { cloud.name, podTemplate.getName() });
                 KubernetesCloud kubernetesCloud = (KubernetesCloud) cloud;
                 kubernetesCloud.removeDynamicTemplate(podTemplate);
-                KubernetesClient client = kubernetesCloud.connect();
-                Boolean deleted = client.pods().withName(podTemplate.getName()).delete();
-                if (!Boolean.TRUE.equals(deleted)) {
-                    LOGGER.log(Level.WARNING, "Failed to delete pod for agent {0}/{1}: not found",
-                            new String[] { client.getNamespace(), podTemplate.getName() });
-                    return;
-                }
             } else {
                 LOGGER.log(Level.WARNING, "Cloud is not a KubernetesCloud: {0} {1}",
                         new String[] { cloud.name, cloud.getClass().getName() });

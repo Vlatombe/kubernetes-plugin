@@ -33,6 +33,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import org.apache.commons.compress.utils.IOUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.csanchez.jenkins.plugins.kubernetes.ContainerEnvVar;
 import org.csanchez.jenkins.plugins.kubernetes.ContainerTemplate;
 import org.csanchez.jenkins.plugins.kubernetes.KubernetesCloud;
@@ -44,28 +45,21 @@ import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.Rule;
+import org.junit.rules.TestName;
 import org.jvnet.hudson.test.BuildWatcher;
 import org.jvnet.hudson.test.JenkinsRuleNonLocalhost;
 import org.jvnet.hudson.test.LoggerRule;
-
-import com.google.common.collect.ImmutableMap;
 
 import hudson.EnvVars;
 import hudson.slaves.EnvironmentVariablesNodeProperty;
 import hudson.slaves.NodeProperty;
 import hudson.slaves.NodePropertyDescriptor;
 import hudson.util.DescribableList;
-import io.fabric8.kubernetes.api.model.Secret;
-import io.fabric8.kubernetes.api.model.SecretBuilder;
-import io.fabric8.kubernetes.client.KubernetesClient;
 import jenkins.model.JenkinsLocationConfiguration;
 
-public class AbstractKubernetesPipelineTest {
+public abstract class AbstractKubernetesPipelineTest {
     protected static final String CONTAINER_ENV_VAR_VALUE = "container-env-var-value";
     protected static final String POD_ENV_VAR_VALUE = "pod-env-var-value";
-    protected static final String SECRET_KEY = "password";
-    protected static final String CONTAINER_ENV_VAR_FROM_SECRET_VALUE = "container-pa55w0rd";
-    protected static final String POD_ENV_VAR_FROM_SECRET_VALUE = "pod-pa55w0rd";
     protected static final String GLOBAL = "GLOBAL";
 
     @ClassRule
@@ -83,10 +77,25 @@ public class AbstractKubernetesPipelineTest {
         assumeKubernetes();
     }
 
+    @Rule
+    public TestName name = new TestName();
+
+    private String projectName;
+
+    @Before
+    public void defineProjectName() {
+        // Add spaces before uppercases
+        this.projectName = name.getMethodName().replaceAll("([A-Z])", " $1");
+    }
+
+    protected String getProjectName() {
+        return projectName;
+    }
+
     @Before
     public void configureCloud() throws Exception {
-        cloud = setupCloud(this);
-        createSecret(cloud.connect());
+        cloud = setupCloud(this, name);
+        createSecret(cloud.connect(), cloud.getNamespace());
         cloud.getTemplates().clear();
         cloud.addTemplate(buildBusyboxTemplate("busybox"));
 
@@ -94,9 +103,10 @@ public class AbstractKubernetesPipelineTest {
         URL url = r.getURL();
 
         String hostAddress = System.getProperty("jenkins.host.address");
-        if (hostAddress == null) {
+        if (StringUtils.isBlank(hostAddress)) {
             hostAddress = InetAddress.getLocalHost().getHostAddress();
         }
+        System.err.println("Calling home to address: " + hostAddress);
         URL nonLocalhostUrl = new URL(url.getProtocol(), hostAddress, url.getPort(),
                 url.getFile());
         JenkinsLocationConfiguration.get().setUrl(nonLocalhostUrl.toString());
@@ -125,21 +135,15 @@ public class AbstractKubernetesPipelineTest {
     }
 
     protected String loadPipelineScript(String name) {
+        return loadPipelineScript(getClass(), name);
+    }
+
+    public static String loadPipelineScript(Class<?> clazz, String name) {
         try {
-            return new String(IOUtils.toByteArray(getClass().getResourceAsStream(name)));
+            return new String(IOUtils.toByteArray(clazz.getResourceAsStream(name)));
         } catch (Throwable t) {
             throw new RuntimeException("Could not read resource:[" + name + "].");
         }
-    }
-
-    private static void createSecret(KubernetesClient client) {
-        Secret secret = new SecretBuilder()
-                .withStringData(ImmutableMap.of(SECRET_KEY, CONTAINER_ENV_VAR_FROM_SECRET_VALUE)).withNewMetadata()
-                .withName("container-secret").endMetadata().build();
-        client.secrets().createOrReplace(secret);
-        secret = new SecretBuilder().withStringData(ImmutableMap.of(SECRET_KEY, POD_ENV_VAR_FROM_SECRET_VALUE))
-                .withNewMetadata().withName("pod-secret").endMetadata().build();
-        client.secrets().createOrReplace(secret);
     }
 
     private static void setEnvVariables(PodTemplate podTemplate) {

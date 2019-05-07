@@ -1,11 +1,12 @@
 pipeline {
   agent {
     kubernetes {
-      label 'mypod'
+      label 'declarativeFromYaml'
       yaml """
 metadata:
   labels:
     some-label: some-label-value
+    class: KubernetesDeclarativeAgentTest
 spec:
   containers:
   - name: jnlp

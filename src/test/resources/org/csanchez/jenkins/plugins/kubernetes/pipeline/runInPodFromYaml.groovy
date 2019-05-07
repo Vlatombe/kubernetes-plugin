@@ -1,4 +1,4 @@
-podTemplate(label: 'mypod', yaml: """
+podTemplate(label: 'runInPodFromYaml', yaml: """
 apiVersion: v1
 kind: Pod
 metadata:
@@ -17,7 +17,7 @@ spec:
 """
 ) {
 
-    node ('mypod') {
+    node ('runInPodFromYaml') {
       stage('Run') {
         container('busybox') {
           sh """
@@ -25,7 +25,7 @@ spec:
             ##
             echo "script file: \$(find ../../.. -iname script.sh))"
             echo "script file contents: \$(find ../../.. -iname script.sh -exec cat {} \\;)"
-            test -n "\$(cat \$(find ../../.. -iname script.sh))"
+            test -n "\$(cat \"\$(find ../../.. -iname script.sh)\")"
           """
         }
       }

@@ -24,12 +24,15 @@
 
 package org.csanchez.jenkins.plugins.kubernetes;
 
+import static org.hamcrest.Matchers.*;
 import static org.junit.Assert.*;
 
 import java.util.Arrays;
 import java.util.List;
 
 import org.csanchez.jenkins.plugins.kubernetes.model.KeyValueEnvVar;
+import org.csanchez.jenkins.plugins.kubernetes.pod.retention.Default;
+import org.csanchez.jenkins.plugins.kubernetes.pod.retention.Never;
 import org.csanchez.jenkins.plugins.kubernetes.volumes.EmptyDirVolume;
 import org.csanchez.jenkins.plugins.kubernetes.volumes.HostPathVolume;
 import org.jenkinsci.plugins.kubernetes.credentials.FileSystemServiceAccountCredential;
@@ -40,12 +43,16 @@ import org.junit.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.recipes.LocalData;
 
-import com.cloudbees.jenkins.plugins.sshcredentials.impl.BasicSSHUserPrivateKey;
 import com.cloudbees.plugins.credentials.Credentials;
-import com.cloudbees.plugins.credentials.CredentialsScope;
 import com.cloudbees.plugins.credentials.SystemCredentialsProvider;
 import com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl;
 
+import hudson.plugins.git.GitTool;
+import hudson.slaves.NodeProperty;
+import hudson.slaves.NodePropertyDescriptor;
+import hudson.tools.ToolLocationNodeProperty;
+import hudson.tools.ToolLocationNodeProperty.ToolLocation;
+import hudson.util.DescribableList;
 import hudson.util.Secret;
 
 /**
@@ -62,8 +69,20 @@ public class KubernetesTest {
 
     @Before
     public void before() throws Exception {
-        cloud = r.jenkins.clouds.get(KubernetesCloud.class);
         r.configRoundtrip();
+        cloud = r.jenkins.clouds.get(KubernetesCloud.class);
+        assertNotNull(cloud);
+    }
+
+    @Test
+    @LocalData()
+    public void upgradeFrom_1_10() throws Exception {
+        List<PodTemplate> templates = cloud.getTemplates();
+        assertPodTemplates(templates);
+        assertEquals(new Never(), cloud.getPodRetention());
+        PodTemplate template = templates.get(0);
+        assertEquals(new Default(), template.getPodRetention());
+        assertEquals(cloud.DEFAULT_WAIT_FOR_POD_SEC, cloud.getWaitForPodSec());
     }
 
     @Test
@@ -77,6 +96,8 @@ public class KubernetesTest {
         FileSystemServiceAccountCredential cred1 = (FileSystemServiceAccountCredential) credentials.get(1);
         StringCredentialsImpl cred2 = (StringCredentialsImpl) credentials.get(2);
         assertEquals("mytoken", Secret.toString(cred2.getSecret()));
+        assertThat(cloud.getLabels(), hasEntry("jenkins", "slave"));
+        assertEquals(cloud.DEFAULT_WAIT_FOR_POD_SEC, cloud.getWaitForPodSec());
     }
 
     @Test
@@ -86,6 +107,23 @@ public class KubernetesTest {
         assertPodTemplates(templates);
         assertEquals(Arrays.asList(new KeyValueEnvVar("pod_a_key", "pod_a_value"),
                 new KeyValueEnvVar("pod_b_key", "pod_b_value")), templates.get(0).getEnvVars());
+        assertEquals(cloud.DEFAULT_WAIT_FOR_POD_SEC, cloud.getWaitForPodSec());
+    }
+
+    @Test
+    @LocalData()
+    public void upgradeFrom_0_10() throws Exception {
+        List<PodTemplate> templates = cloud.getTemplates();
+        PodTemplate template = templates.get(0);
+        DescribableList<NodeProperty<?>,NodePropertyDescriptor> nodeProperties = template.getNodeProperties();
+        assertEquals(1, nodeProperties.size());
+        ToolLocationNodeProperty property = (ToolLocationNodeProperty) nodeProperties.get(0);
+        assertEquals(1, property.getLocations().size());
+        ToolLocation location = property.getLocations().get(0);
+        assertEquals("Default", location.getName());
+        assertEquals("/custom/path", location.getHome());
+        assertEquals(GitTool.class, location.getType().clazz);
+        assertEquals(cloud.DEFAULT_WAIT_FOR_POD_SEC, cloud.getWaitForPodSec());
     }
 
     @Test
@@ -93,6 +131,7 @@ public class KubernetesTest {
     public void upgradeFrom_0_8() throws Exception {
         List<PodTemplate> templates = cloud.getTemplates();
         assertPodTemplates(templates);
+        assertEquals(cloud.DEFAULT_WAIT_FOR_POD_SEC, cloud.getWaitForPodSec());
     }
 
     private void assertPodTemplates(List<PodTemplate> templates) {

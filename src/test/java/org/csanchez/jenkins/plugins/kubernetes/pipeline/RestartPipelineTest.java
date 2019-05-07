@@ -24,17 +24,17 @@
 
 package org.csanchez.jenkins.plugins.kubernetes.pipeline;
 
-import com.google.common.collect.ImmutableMap;
-import hudson.model.Node;
-import hudson.slaves.DumbSlave;
-import hudson.slaves.JNLPLauncher;
-import hudson.slaves.NodeProperty;
-import hudson.slaves.RetentionStrategy;
-import io.fabric8.kubernetes.api.model.Secret;
-import io.fabric8.kubernetes.api.model.SecretBuilder;
-import io.fabric8.kubernetes.client.KubernetesClient;
-import jenkins.model.JenkinsLocationConfiguration;
+import static java.util.Arrays.*;
+import static org.csanchez.jenkins.plugins.kubernetes.KubernetesTestUtil.*;
+
+import java.net.InetAddress;
+import java.net.URL;
+import java.util.Collections;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
 import org.apache.commons.compress.utils.IOUtils;
+import org.apache.commons.lang.StringUtils;
 import org.csanchez.jenkins.plugins.kubernetes.ContainerEnvVar;
 import org.csanchez.jenkins.plugins.kubernetes.ContainerTemplate;
 import org.csanchez.jenkins.plugins.kubernetes.KubernetesCloud;
@@ -50,19 +50,17 @@ import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.junit.rules.TestName;
 import org.jvnet.hudson.test.BuildWatcher;
 import org.jvnet.hudson.test.LoggerRule;
 import org.jvnet.hudson.test.RestartableJenkinsNonLocalhostRule;
 
-import java.net.InetAddress;
-import java.net.URL;
-import java.util.Collections;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-
-import static java.util.Arrays.asList;
-import static org.csanchez.jenkins.plugins.kubernetes.KubernetesTestUtil.assumeKubernetes;
-import static org.csanchez.jenkins.plugins.kubernetes.KubernetesTestUtil.setupCloud;
+import hudson.model.Node;
+import hudson.slaves.DumbSlave;
+import hudson.slaves.JNLPLauncher;
+import hudson.slaves.NodeProperty;
+import hudson.slaves.RetentionStrategy;
+import jenkins.model.JenkinsLocationConfiguration;
 
 public class RestartPipelineTest {
     protected static final String CONTAINER_ENV_VAR_VALUE = "container-env-var-value";
@@ -85,19 +83,12 @@ public class RestartPipelineTest {
            Level.ALL);
     //.record("org.jenkinsci.plugins.durabletask", Level.ALL).record("org.jenkinsci.plugins.workflow.support.concurrent", Level.ALL).record("org.csanchez.jenkins.plugins.kubernetes.pipeline", Level.ALL);
 
+    @Rule
+    public TestName name = new TestName();
+
     @BeforeClass
     public static void isKubernetesConfigured() throws Exception {
         assumeKubernetes();
-    }
-
-    private static void createSecret(KubernetesClient client) {
-        Secret secret = new SecretBuilder()
-                .withStringData(ImmutableMap.of(SECRET_KEY, CONTAINER_ENV_VAR_FROM_SECRET_VALUE)).withNewMetadata()
-                .withName("container-secret").endMetadata().build();
-        client.secrets().createOrReplace(secret);
-        secret = new SecretBuilder().withStringData(ImmutableMap.of(SECRET_KEY, POD_ENV_VAR_FROM_SECRET_VALUE))
-                .withNewMetadata().withName("pod-secret").endMetadata().build();
-        client.secrets().createOrReplace(secret);
     }
 
     private static void setEnvVariables(PodTemplate podTemplate) {
@@ -126,8 +117,8 @@ public class RestartPipelineTest {
     }
 
     public void configureCloud() throws Exception {
-        cloud = setupCloud(this);
-        createSecret(cloud.connect());
+        cloud = setupCloud(this, name);
+        createSecret(cloud.connect(), cloud.getNamespace());
         cloud.getTemplates().clear();
         cloud.addTemplate(buildBusyboxTemplate("busybox"));
 
@@ -135,9 +126,10 @@ public class RestartPipelineTest {
         URL url = story.j.getURL();
 
         String hostAddress = System.getProperty("jenkins.host.address");
-        if (hostAddress == null) {
+        if (StringUtils.isBlank(hostAddress)) {
             hostAddress = InetAddress.getLocalHost().getHostAddress();
         }
+        System.err.println("Calling home to address: " + hostAddress);
         URL nonLocalhostUrl = new URL(url.getProtocol(), hostAddress, url.getPort(),
                 url.getFile());
         JenkinsLocationConfiguration.get().setUrl(nonLocalhostUrl.toString());
@@ -213,8 +205,8 @@ public class RestartPipelineTest {
         story.then(r -> {
             WorkflowRun b = r.jenkins.getItemByFullName("p", WorkflowJob.class).getBuildByNumber(1);
             r.assertBuildStatusSuccess(r.waitForCompletion(b));
-            r.assertLogContains("INFO: Handshaking", b);
-            r.assertLogContains("INFO: Connected", b);
+            r.assertLogContains("[Pipeline] containerLog", b);
+            r.assertLogContains("[Pipeline] End of Pipeline", b);
         });
     }
 }

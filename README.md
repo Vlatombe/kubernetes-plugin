@@ -14,11 +14,13 @@ For that some environment variables are automatically injected:
 
 * `JENKINS_URL`: Jenkins web interface url
 * `JENKINS_SECRET`: the secret key for authentication
-* `JENKINS_NAME`: the name of the Jenkins agent
+* `JENKINS_AGENT_NAME`: the name of the Jenkins agent
+* `JENKINS_NAME`: the name of the Jenkins agent (Deprecated. Only here for backwards compatibility)
 
 Tested with [`jenkins/jnlp-slave`](https://hub.docker.com/r/jenkins/jnlp-slave),
 see the [Docker image source code](https://github.com/jenkinsci/docker-jnlp-slave).
 
+It is not required to run the Jenkins master inside Kubernetes. 
 
 # Kubernetes Cloud Configuration
 
@@ -27,6 +29,15 @@ _Name_, _Kubernetes URL_, _Kubernetes server certificate key_, ...
 
 If _Kubernetes URL_ is not set, the connection options will be autoconfigured from service account or kube config file.
 
+When running the Jenkins master outside of Kubernetes you will need to set the credential to secret text. The value of the credential will be the token of the service account you created for Jenkins in the cluster the agents will run on.
+
+### Restricting what jobs can use your configured cloud
+
+Clouds can be configured to only allow certain jobs to use them.
+
+To enable this, in your cloud's advanced configuration check the
+`Restrict pipeline support to authorized folders` box. For a job to then
+use this cloud configuration you will need to add it in the jobs folder's configuration.
 
 # Pipeline support
 
@@ -64,7 +75,19 @@ Find more examples in the [examples dir](examples).
 The default jnlp agent image used can be customized by adding it to the template
 
 ```groovy
-containerTemplate(name: 'jnlp', image: 'jenkins/jnlp-slave:3.10-1-alpine', args: '${computer.jnlpmac} ${computer.name}'),
+containerTemplate(name: 'jnlp', image: 'jenkins/jnlp-slave:3.27-1-alpine', args: '${computer.jnlpmac} ${computer.name}'),
+```
+
+or with the yaml syntax
+
+```
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: jnlp
+    image: 'jenkins/jnlp-slave:3.27-1-alpine'
+    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
 ```
 
 ### Container Group Support
@@ -126,11 +149,12 @@ Either way it provides access to the following fields:
 * **envVars** Environment variables that are applied to **ALL** containers.
     * **envVar** An environment variable whose value is defined inline.
     * **secretEnvVar** An environment variable whose value is derived from a Kubernetes secret.
-* **imagePullSecrets** List of pull secret names
+* **imagePullSecrets** List of pull secret names, to [pull images from a private Docker registry](https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/).
 * **annotations** Annotations to apply to the pod.
 * **inheritFrom** List of one or more pod templates to inherit from *(more details below)*.
-* **slaveConnectTimeout** Timeout in seconds for an agent to be online.
-* **activeDeadlineSeconds** Pod is deleted after this deadline is passed.
+* **slaveConnectTimeout** Timeout in seconds for an agent to be online *(more details below)*.
+* **podRetention** Controls the behavior of keeping slave pods. Can be 'never()', 'onFailure()', 'always()', or 'default()' - if empty will default to deleting the pod after `activeDeadlineSeconds` has passed.
+* **activeDeadlineSeconds** If `podRetention` is set to 'never()' or 'onFailure()', pod is deleted after this deadline is passed.
 * **idleMinutes** Allows the Pod to remain active for reuse until the configured number of minutes has passed since the last step was executed on it.
 
 The `containerTemplate` is a template of container that will be added to the pod. Again, its configurable via the user interface or via pipeline and allows you to set the following fields:
@@ -143,8 +167,13 @@ The `containerTemplate` is a template of container that will be added to the pod
 * **command** The command the container will execute.
 * **args** The arguments passed to the command.
 * **ttyEnabled** Flag to mark that tty should be enabled.
-* **livenessProbe** Parameters to be added to a exec liveness probe in the container (does not suppot httpGet liveness probes)
+* **livenessProbe** Parameters to be added to a exec liveness probe in the container (does not support httpGet liveness probes)
 * **ports** Expose ports on the container.
+
+#### Specifying a different default agent connection timeout
+
+By default, the agent connection timeout is set to 100 seconds. In some case, you would like to set a different value, if so you can set the system property `org.csanchez.jenkins.plugins.kubernetes.PodTemplate.connectionTimeout` to a different value. Please read [Features controlled by system properties](https://wiki.jenkins.io/display/JENKINS/Features+controlled+by+system+properties) page to know how to setup system properties within Jenkins.
+
 
 #### Using yaml to Define Pod Templates
 
@@ -176,7 +205,7 @@ spec:
 }
 ```
 
-You can use [`readFile` step](https://jenkins.io/doc/pipeline/steps/workflow-basic-steps/#code-readfile-code-read-file-from-workspace) to load the yaml from a file.  It is also accessible from this plugin's configuration panel in the Jenkins console.
+You can use [`readFile`](https://jenkins.io/doc/pipeline/steps/workflow-basic-steps/#code-readfile-code-read-file-from-workspace) or [`readTrusted`](https://jenkins.io/doc/pipeline/steps/coding-webhook/#readtrusted-read-trusted-file-from-scm) steps to load the yaml from a file.  It is also accessible from this plugin's configuration panel in the Jenkins console.
 
 #### Liveness Probe Usage
 ```groovy
@@ -187,6 +216,8 @@ See [Defining a liveness command](https://kubernetes.io/docs/tasks/configure-pod
 ### Pod template inheritance
 
 A podTemplate may or may not inherit from an existing template. This means that the podTemplate will inherit node selector, service account, image pull secrets, containerTemplates and volumes from the template it inheritsFrom.
+
+**yaml** is **never** merged, if is defined in the child pod template that one will be used and not the parent one.
 
 **Service account** and **Node selector** when are overridden completely substitute any possible value found on the 'parent'.
 
@@ -237,19 +268,21 @@ Say heres our file `src/com/foo/utils/PodTemplates.groovy`:
 package com.foo.utils
 
 public void dockerTemplate(body) {
+  def label = "worker-${UUID.randomUUID().toString()}"
   podTemplate(label: label,
         containers: [containerTemplate(name: 'docker', image: 'docker', command: 'cat', ttyEnabled: true)],
         volumes: [hostPathVolume(hostPath: '/var/run/docker.sock', mountPath: '/var/run/docker.sock')]) {
-    body()
+    body.call(label)
 }
 }
 
 public void mavenTemplate(body) {
+  def label = "worker-${UUID.randomUUID().toString()}"
   podTemplate(label: label,
         containers: [containerTemplate(name: 'maven', image: 'maven', command: 'cat', ttyEnabled: true)],
         volumes: [secretVolume(secretName: 'maven-settings', mountPath: '/root/.m2'),
                   persistentVolumeClaim(claimName: 'maven-local-repo', mountPath: '/root/.m2nrepo')]) {
-    body()
+    body.call(label)
 }
 }
 
@@ -258,14 +291,16 @@ return this
 
 Then consumers of the library could just express the need for a maven pod with docker capabilities by combining the two, however once again, you will need to express the specific container you wish to execute commands in.  You can **NOT** omit the `node` statement.
 
+Note that you **must** use the innermost generated label in order get a node which has all the outer pods available on the node as shown in this example:
+
 ```groovy
 import com.foo.utils.PodTemplates
 
 slaveTemplates = new PodTemplates()
 
 slaveTemplates.dockerTemplate {
-  slaveTemplates.mavenTemplate {
-    node('label') {
+  slaveTemplates.mavenTemplate { label ->
+    node(label) {
       container('docker') {
         sh 'echo hello from docker'
       }
@@ -390,6 +425,23 @@ spec:
 }
 ```
 
+or using `yamlFile` to keep the pod template in a separate `KubernetesPod.yaml` file
+
+```
+pipeline {
+  agent {
+    kubernetes {
+      label 'mypod'
+      defaultContainer 'jnlp'
+      yamlFile 'KubernetesPod.yaml'
+    }
+  }
+  stages {
+      ...
+  }
+}
+```
+
 Note that it was previously possible to define `containerTemplate` but that has been deprecated in favor of the yaml format.
 
 ```groovy
@@ -407,6 +459,30 @@ pipeline {
     }
   }
   stages { ... }
+}
+```
+
+Run the Pipeline or individual stage within a custom workspace - not required unless explicitly stated.
+
+```
+pipeline {
+  agent {
+    kubernetes {
+      label 'mypod'
+      customWorkspace 'some/other/path'
+      defaultContainer 'maven'
+      yamlFile 'KubernetesPod.yaml'
+    }
+  }
+
+  stages {
+    stage('Run maven') {
+      steps {
+        sh 'mvn -version'
+        sh "echo Workspace dir is ${pwd()}"
+      }
+    }
+  }
 }
 ```
 
@@ -457,7 +533,6 @@ you can use these flags during Jenkins startup:
     -Dhudson.slaves.NodeProvisioner.MARGIN=50
     -Dhudson.slaves.NodeProvisioner.MARGIN0=0.85
 
-
 # Configuration on minikube
 
 Create and start [minikube](https://github.com/kubernetes/minikube)
@@ -468,7 +543,7 @@ The client certificate needs to be converted to PKCS, will need a password
 
 Validate that the certificates work
 
-    curl --cacert ~/.minikube/ca.crt --cert ~/.minikube/minikube.pfx:secret https://$(minikube ip):8443
+    curl --cacert ~/.minikube/ca.crt --cert ~/.minikube/minikube.pfx:secret --cert-type P12 https://$(minikube ip):8443
 
 Add a Jenkins credential of type certificate, upload it from `~/.minikube/minikube.pfx`, password `secret`
 
@@ -517,7 +592,7 @@ at `DEBUG` level.
 
 ## Deleting pods in bad state
 
-    kubectl get -a pods -o name --selector=jenkins=agent | xargs -I {} kubectl delete {}
+    kubectl get pods -o name --selector=jenkins=slave --all-namespaces  | xargs -I {} kubectl delete {}
 
 # Building and Testing
 
@@ -556,6 +631,13 @@ does not have a public hostname for the VM to access, you can set the `jenkins.h
 system property to the (host-only or NAT) IP of your host:
 
     mvn clean install -Djenkins.host.address=192.168.99.1
+
+### Integration Tests with Microk8s
+
+If [Microk8s](https://microk8s.io/) is running and is the default context in your `~/.kube/config`,
+just run as
+
+    mvn clean install -Pmicrok8s
 
 ### Integration Tests in a Different Cluster
 
@@ -702,4 +784,4 @@ Note: the JVM will use the memory `requests` as the heap limit (-Xmx)
 # Related Projects
 
 * [Kubernetes Pipeline plugin](https://github.com/jenkinsci/kubernetes-pipeline-plugin): pipeline extension to provide native support for using Kubernetes pods, secrets and volumes to perform builds
-* [Kubernetes Secrets Credentials plugin](https://github.com/hoshsadiq/jenkins-kubernetes-secrets-credentials): Credentials provider that reads Kubernetes secrets
+* [kubernetes-credentials](https://github.com/jenkinsci/kubernetes-credentials-plugin): Credentials provider that reads Kubernetes secrets

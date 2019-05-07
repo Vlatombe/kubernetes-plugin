@@ -24,10 +24,9 @@
 package org.csanchez.jenkins.plugins.kubernetes.pipeline
 
 import hudson.model.Result
-import org.jenkinsci.plugins.pipeline.modeldefinition.SyntheticStageNames
+import org.jenkinsci.plugins.pipeline.modeldefinition.agent.CheckoutScript
 import org.jenkinsci.plugins.pipeline.modeldefinition.agent.DeclarativeAgentScript
 import org.jenkinsci.plugins.workflow.cps.CpsScript
-
 
 public class KubernetesDeclarativeAgentScript extends DeclarativeAgentScript<KubernetesDeclarativeAgent> {
     public KubernetesDeclarativeAgentScript(CpsScript s, KubernetesDeclarativeAgent a) {
@@ -37,36 +36,32 @@ public class KubernetesDeclarativeAgentScript extends DeclarativeAgentScript<Kub
     @Override
     public Closure run(Closure body) {
         return {
-            try {
-                script.podTemplate(describable.asArgs) {
-                    script.node(describable.label) {
-                        if (describable.isDoCheckout() && describable.hasScmContext(script)) {
-                            if (!describable.inStage) {
-                                script.stage(SyntheticStageNames.checkout()) {
-                                    script.checkout script.scm
-                                }
-                            } else {
-                                // No stage when we're in a nested stage already
-                                script.checkout script.scm
-                            }
-                        }
+            if ((describable.getYamlFile() != null) && (describable.hasScmContext(script))) {
+                describable.setYaml(script.readTrusted(describable.getYamlFile()))
+            }
+            script.podTemplate(describable.asArgs) {
+                script.node(describable.label) {
+                    CheckoutScript.doCheckout(script, describable, describable.customWorkspace) {
                         // what container to use for the main body
-                        def container = describable.defaultContainer ?: 'jnlp';
+                        def container = describable.defaultContainer ?: 'jnlp'
 
                         if (describable.containerTemplate != null) {
                             // run inside the container declared for backwards compatibility
-                            container = describable.containerTemplate.asArgs;
+                            container = describable.containerTemplate.asArgs
                         }
 
                         // call the main body
-                        script.container(container) {
+                        if (container == 'jnlp') {
+                            // If default container is not changed by the pipeline user,
+                            // do not enclose the body with a `container` statement.
                             body.call()
+                        } else {
+                            script.container(container) {
+                                body.call()
+                            }
                         }
-                    }
+                    }.call()
                 }
-            } catch (Exception e) {
-                script.getProperty("currentBuild").result = Result.FAILURE
-                throw e
             }
         }
     }
