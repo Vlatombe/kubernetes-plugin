@@ -8,11 +8,21 @@ pipeline {
       metadata:
       spec:
         containers:
+        - name: jnlp
+          volumeMounts:
+          - name: tmp
+            mountPath: /tmp
         - name: ssh-client
           image: kroniak/ssh-client:3.6
           command:
           - cat
           tty: true
+          volumeMounts:
+          - name: tmp
+            mountPath: /tmp
+        volumes:
+        - name: tmp
+          emptyDir: {}
       """
       }
     }

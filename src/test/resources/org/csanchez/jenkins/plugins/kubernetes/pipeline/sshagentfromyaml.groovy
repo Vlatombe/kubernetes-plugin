@@ -4,11 +4,21 @@ kind: Pod
 metadata:
 spec:
   containers:
+  - name: jnlp
+    volumeMounts:
+    - mountPath: /tmp
+      name: tmp
   - name: ssh-client
     image: kroniak/ssh-client:3.6
     command:
     - cat
     tty: true
+    volumeMounts:
+    - mountPath: /tmp
+      name: tmp
+  volumes:
+  - name: tmp
+    emptyDir: {}
 """
 )
 {

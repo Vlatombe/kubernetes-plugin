@@ -1,6 +1,6 @@
 podTemplate(label: 'sshagent', containers: [
-        containerTemplate(name: 'ssh-client', image: 'kroniak/ssh-client:3.6', ttyEnabled: true, command: 'cat')
-]) {
+        containerTemplate(name: 'ssh-client', image: 'kroniak/ssh-client:3.6', ttyEnabled: true, command: 'cat'),
+    ], volumes: [emptyDirVolume(mountPath: '/tmp', memory: false)]) {
     node ('sshagent') {
         stage('container log') {
             container('ssh-client') {
