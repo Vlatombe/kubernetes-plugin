@@ -284,8 +284,19 @@ public class KubernetesSlave extends AbstractCloudSlave {
         // Prior to termination, determine if we should delete the slave pod based on
         // the slave pod's current state and the pod retention policy.
         // Healthy slave pods should still have a JNLP agent running at this point.
-        Pod pod = client.pods().inNamespace(getNamespace()).withName(name).get();
+        LOGGER.log(Level.FINEST, () -> "Checking if pod " + getNamespace() + "/" + getPodName() + " still exists");
+        Pod pod = client.pods().inNamespace(getNamespace()).withName(getPodName()).get();
+        if (pod != null) {
+            LOGGER.log(Level.FINEST, () -> "Pod " + getNamespace() + "/" + getPodName() + " still exists");
+        } else {
+            LOGGER.log(Level.FINEST, () -> "Pod " + getNamespace() + "/" + getPodName() + " is gone");
+        }
         boolean deletePod = getPodRetention(cloud).shouldDeletePod(cloud, pod);
+        if (deletePod) {
+            LOGGER.log(Level.FINEST, () -> "Pod " + getNamespace() + "/" + getPodName() + " will be deleted according to pod retention");
+        } else {
+            LOGGER.log(Level.FINEST, () -> "Pod " + getNamespace() + "/" + getPodName() + " will be kept according to pod retention");
+        }
         
         Computer computer = toComputer();
         if (computer == null) {
@@ -296,6 +307,7 @@ public class KubernetesSlave extends AbstractCloudSlave {
         }
 
         // Tell the slave to stop JNLP reconnects.
+        LOGGER.log(Level.FINEST, () -> "Sending order to not reconnect agent " + name);
         VirtualChannel ch = computer.getChannel();
         if (ch != null) {
             Future<Void> disconnectorFuture = ch.callAsync(new SlaveDisconnector());
@@ -308,6 +320,7 @@ public class KubernetesSlave extends AbstractCloudSlave {
         }
 
         // Disconnect the master from the slave agent
+        LOGGER.log(Level.FINEST, () -> "Setting agent " + name + " temporary offline before removal");
         OfflineCause offlineCause = OfflineCause.create(new Localizable(HOLDER, "Setting offline before shutting down"));
         computer.setTemporarilyOffline(true, offlineCause);
 
@@ -332,26 +345,25 @@ public class KubernetesSlave extends AbstractCloudSlave {
 
     private void deleteSlavePod(TaskListener listener, KubernetesClient client) throws IOException {
         try {
-            Boolean deleted = client.pods().inNamespace(getNamespace()).withName(name).
+            LOGGER.log(Level.FINEST, () -> "Deleting pod for agent " + getNamespace() + "/" + getPodName());
+            Boolean deleted = client.pods().inNamespace(getNamespace()).withName(getPodName()).
                 cascading(true). // TODO JENKINS-58306 pending https://github.com/fabric8io/kubernetes-client/pull/1620
                 delete();
-            if (!Boolean.TRUE.equals(deleted)) {
-                String msg = String.format("Failed to delete pod for agent %s/%s: not found", getNamespace(), name);
+            if (Boolean.TRUE.equals(deleted)) {
+                String msg = String.format("Terminated Kubernetes instance for agent %s/%s", getNamespace(), getPodName());
+                LOGGER.log(Level.INFO, msg);
+                listener.getLogger().println(msg);
+            } else {
+                String msg = String.format("Failed to delete pod %s/%s for agent %s: not found", getNamespace(), getPodName(), name);
                 LOGGER.log(Level.WARNING, msg);
                 listener.error(msg);
-                return;
             }
         } catch (KubernetesClientException e) {
-            String msg = String.format("Failed to delete pod for agent %s/%s: %s", getNamespace(), name,
+            String msg = String.format("Failed to delete pod %s/%s for agent %s: %s", getNamespace(), getPodName(), name,
                     e.getMessage());
             LOGGER.log(Level.WARNING, msg, e);
             listener.error(msg);
-            return;
         }
-
-        String msg = String.format("Terminated Kubernetes instance for agent %s/%s", getNamespace(), name);
-        LOGGER.log(Level.INFO, msg);
-        listener.getLogger().println(msg);
     }
 
     @Override
